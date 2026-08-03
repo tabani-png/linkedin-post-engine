@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""ingest_voice.py — measure an account's real posts into a voice profile.
+
+The engine's hardest constraint is that it writes in somebody else's voice. That
+only works if the profile is measured rather than imagined, so this script does
+the measuring and refuses to guess.
+
+Input is a JSON file: either a list of post objects, or an object with a "posts"
+key holding that list. Each post needs "text". Everything else is optional:
+
+    [
+      {"text": "...", "reactions": 101, "comments": 4, "reposts": 0,
+       "url": "https://www.linkedin.com/feed/update/...", "posted_at": "2026-07-12"}
+    ]
+
+That is the shape the Leadshark MCP list_recent_posts / list_person_posts calls
+return, so the agent pulling the posts writes the JSON and this script reads it.
+No network access lives here on purpose: the pull is an agent step with its own
+auth, the measurement is deterministic and reviewable.
+
+Usage:
+    python3 scripts/ingest_voice.py posts.json --name "Jane Doe" --slug founder
+    python3 scripts/ingest_voice.py posts.json --name "Jane Doe" --out doctrine/VOICE-PROFILE-founder.md
+
+Writes nothing over an existing file unless --force is passed, because a measured
+profile is doctrine and doctrine is human owned.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import statistics
+import sys
+from datetime import date
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF☀-➿←-⇿⬀-⯿]")
+SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+CLOSER_RE = re.compile(r"\b(dm me|dm or comment|comment or dm|comment below|drop a|link in|sign up|register)\b", re.I)
+NUMBER_RE = re.compile(r"(?<![\w.])\$?\d[\d,.]*\s*(?:%|k|m|bn|x)?\b", re.I)
+HASHTAG_RE = re.compile(r"#\w+")
+LADDER_RE = re.compile(r"[1-9]️?⃣")
+MIN_POSTS = 5
+
+
+def words(text: str) -> int:
+    return len(re.findall(r"\b[\w']+\b", text))
+
+
+def measure(posts: list[dict]) -> dict:
+    texts = [(p.get("text") or "").strip() for p in posts]
+    texts = [t for t in texts if t]
+    if not texts:
+        sys.exit("no posts with text in that file")
+
+    wcounts = sorted(words(t) for t in texts)
+    sentences: list[int] = []
+    for t in texts:
+        for s in SENTENCE_SPLIT.split(t):
+            n = words(s)
+            if n:
+                sentences.append(n)
+
+    emoji_per_post = [len(EMOJI_RE.findall(t)) for t in texts]
+    hooks = [t.splitlines()[0].strip() for t in texts if t.splitlines()]
+
+    return {
+        "n": len(texts),
+        "words_min": wcounts[0],
+        "words_max": wcounts[-1],
+        "words_median": int(statistics.median(wcounts)),
+        "words_mean": round(statistics.mean(wcounts)),
+        "words_all": wcounts,
+        "sentence_mean": round(statistics.mean(sentences), 1) if sentences else 0,
+        "sentence_median": int(statistics.median(sentences)) if sentences else 0,
+        "short_sentences": sum(1 for s in sentences if s < 8),
+        "sentences_total": len(sentences),
+        "emoji_zero_posts": sum(1 for e in emoji_per_post if e == 0),
+        "emoji_max": max(emoji_per_post) if emoji_per_post else 0,
+        "emoji_median": int(statistics.median(emoji_per_post)) if emoji_per_post else 0,
+        "hashtag_posts": sum(1 for t in texts if HASHTAG_RE.search(t)),
+        "emdash_posts": sum(1 for t in texts if "—" in t or "–" in t),
+        "ladder_posts": sum(1 for t in texts if len(LADDER_RE.findall(t)) >= 2),
+        "we_posts": sum(1 for t in texts if re.search(r"\b(we|our)\b", t, re.I)),
+        "i_posts": sum(1 for t in texts if re.search(r"\bI\b", t)),
+        "closer_posts": sum(1 for t in texts if CLOSER_RE.search(t)),
+        "number_posts": sum(1 for t in texts if NUMBER_RE.search(t)),
+        "hook_chars_median": int(statistics.median([len(h) for h in hooks])) if hooks else 0,
+    }
+
+
+def perf_table(posts: list[dict]) -> list[dict]:
+    """Rank whatever engagement numbers came with the pull. Blind if absent."""
+    rows = []
+    for p in posts:
+        text = (p.get("text") or "").strip()
+        if not text:
+            continue
+        rows.append({
+            "reactions": p.get("reactions"),
+            "comments": p.get("comments"),
+            "reposts": p.get("reposts"),
+            "words": words(text),
+            "emoji": len(EMOJI_RE.findall(text)),
+            "closer": bool(CLOSER_RE.search(text)),
+            "first_line": text.splitlines()[0][:70],
+            "url": p.get("url", ""),
+        })
+    scored = [r for r in rows if isinstance(r["reactions"], int)]
+    scored.sort(key=lambda r: r["reactions"], reverse=True)
+    return scored
+
+
+def render(name: str, m: dict, rows: list[dict], source: str) -> str:
+    pct_short = round(100 * m["short_sentences"] / m["sentences_total"]) if m["sentences_total"] else 0
+    lines = [
+        f"# VOICE-PROFILE — {name}",
+        "",
+        f"## STATUS: MEASURED over {m['n']} posts",
+        "",
+        f"Generated by `scripts/ingest_voice.py` from `{source}` on {date.today().isoformat()}.",
+        "Every number below is counted, not estimated. Prose interpretation is the human's job;",
+        "this file is the evidence it has to agree with.",
+        "",
+        "## Measured",
+        "",
+        "| Dimension | Measurement |",
+        "|---|---|",
+        f"| Length | min {m['words_min']}, median **{m['words_median']}**, mean {m['words_mean']}, longest ever **{m['words_max']}** words |",
+        f"| All post lengths | {', '.join(str(w) for w in m['words_all'])} |",
+        f"| Sentence rhythm | mean {m['sentence_mean']}, median {m['sentence_median']} words. {m['short_sentences']} of {m['sentences_total']} sentences are under 8 words ({pct_short}%) |",
+        f"| Emoji | median {m['emoji_median']} per post, max {m['emoji_max']}. {m['emoji_zero_posts']} of {m['n']} posts have zero |",
+        f"| Numbered emoji ladder | {m['ladder_posts']} of {m['n']} posts |",
+        f"| Em dashes | {m['emdash_posts']} of {m['n']} posts |",
+        f"| Hashtags | {m['hashtag_posts']} of {m['n']} posts |",
+        f"| Person | \"we\" or \"our\" in {m['we_posts']}, \"I\" in {m['i_posts']} |",
+        f"| Explicit closer | {m['closer_posts']} of {m['n']} posts |",
+        f"| Carries a number | {m['number_posts']} of {m['n']} posts |",
+        f"| Hook length | median {m['hook_chars_median']} chars |",
+        "",
+        "## What this implies for doctrine/config.json",
+        "",
+        "Copy these into the client config so the scorer enforces the measured voice,",
+        "not the engine's defaults:",
+        "",
+        "```json",
+        json.dumps({
+            "words_min": max(60, int(m["words_median"] * 0.6)),
+            "words_max": m["words_max"],
+            "emoji_max": max(m["emoji_median"], 2),
+            "hook_max_chars": 200,
+        }, indent=2),
+        "```",
+        "",
+        f"`words_max` is set to their longest post ever ({m['words_max']} words). Writing past it",
+        "means writing something they have never once published.",
+        "",
+    ]
+
+    if rows:
+        lines += [
+            "## Measured performance, best first",
+            "",
+            "This is the account's own prior. It beats any borrowed benchmark from another account.",
+            "",
+            "| reactions | comments | reposts | words | emoji | closer | opening line |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for r in rows:
+            lines.append(
+                f"| {r['reactions']} | {r['comments'] if r['comments'] is not None else ''} "
+                f"| {r['reposts'] if r['reposts'] is not None else ''} | {r['words']} | {r['emoji']} "
+                f"| {'yes' if r['closer'] else 'no'} | {r['first_line'].replace('|', '/')} |"
+            )
+        lines += [
+            "",
+            "Read the top three and the bottom three before drafting. If the template you are about",
+            "to reach for lives at the bottom of this table on this account, it does not matter how",
+            "well it performed somewhere else.",
+            "",
+        ]
+    else:
+        lines += [
+            "## Measured performance",
+            "",
+            "**Blind.** The pull carried no engagement numbers, so shape learning for this account",
+            "has no evidence behind it. Re-pull with reactions, comments and reposts before trusting",
+            "any claim about what performs here.",
+            "",
+        ]
+
+    lines += [
+        "## Still open",
+        "",
+        "1. Line break and whitespace rhythm is only as good as the pull. If the source stripped",
+        "   newlines, ask for 3 to 5 posts pasted as raw text and re-run.",
+        "2. Register cues a counter cannot see: published typos, casing habits, running jokes.",
+        "   Read five posts yourself and write them into this file by hand.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("posts_json", type=Path, help="JSON file of posts (list, or object with a 'posts' key)")
+    ap.add_argument("--name", required=True, help="whose voice this is, as it should read in the heading")
+    ap.add_argument("--slug", default="founder", help="filename slug, default 'founder'")
+    ap.add_argument("--out", type=Path, help="explicit output path, overrides --slug")
+    ap.add_argument("--force", action="store_true", help="overwrite an existing profile")
+    args = ap.parse_args()
+
+    if not args.posts_json.exists():
+        sys.exit(f"no such file: {args.posts_json}")
+    try:
+        raw = json.loads(args.posts_json.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        sys.exit(f"{args.posts_json} is not valid JSON: {exc}")
+
+    posts = raw.get("posts") if isinstance(raw, dict) else raw
+    if not isinstance(posts, list):
+        sys.exit("expected a JSON list of posts, or an object with a 'posts' list")
+
+    out = args.out or REPO / "doctrine" / f"VOICE-PROFILE-{args.slug}.md"
+    if out.exists() and not args.force:
+        sys.exit(f"{out} already exists. Pass --force to overwrite. "
+                 "A measured profile is doctrine, so overwriting one is a human decision.")
+
+    m = measure(posts)
+    rows = perf_table(posts)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render(args.name, m, rows, args.posts_json.name), encoding="utf-8")
+
+    print(f"wrote {out}")
+    print(f"  posts measured : {m['n']}")
+    print(f"  words          : median {m['words_median']}, longest {m['words_max']}")
+    print(f"  emoji          : median {m['emoji_median']}, {m['emoji_zero_posts']}/{m['n']} posts at zero")
+    print(f"  performance    : {'ranked ' + str(len(rows)) + ' posts' if rows else 'BLIND, no engagement numbers in the pull'}")
+    if m["n"] < MIN_POSTS:
+        print(f"\n  WARNING: {m['n']} posts is not a voice profile, it is a coincidence. "
+              f"Pull at least {MIN_POSTS} before trusting any of these numbers.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

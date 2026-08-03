@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+engine.db
+engine.db.bak*
+runs/
+.scratch/
+.DS_Store
