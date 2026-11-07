@@ -126,3 +126,7 @@ downstream can be trusted.
 ## Licence
 
 MIT. See `LICENSE`.
+
+---
+
+Built by [consultance.ai](https://consultance.ai), which builds AI systems for finance teams.
